@@ -1,0 +1,551 @@
+<!DOCTYPE>
+<html>
+	<head>
+		<title>Prototype</title>
+		<script type="text/javascript" src="three.min.js"></script>
+        <script type="text/javascript" src="https://rawgit.com/mrdoob/stats.js/master/build/stats.min.js"></script>
+        <script type="text/javascript" src="dat.gui.min.js"></script>
+		<script type="text/javascript">
+		
+            // SETUP
+			var renderer, scene, camera;
+			var lookAt = new THREE.Vector3(0.0, 0.0, 0.0);
+			var viewerPosition = new THREE.Vector3(0.0, 75.0, -100.0);
+            
+            var creatureGeometry;
+            var foodGeometry;
+            var foodShader;
+            
+            // OBJECT ARRAYS
+            var creatureArr = [];
+            /*
+            creature : {
+                energy: float
+                species: species
+                position: Vec3
+                model: Mesh
+                
+                targetFood: food
+                eating: boolean
+                eatProgress: float
+            }
+            */
+            
+            var foodArr = [];
+            /*
+            food : {
+                energy: float
+                position: Vec3
+                model: Mesh
+                scale: float
+                seekers: [creature]
+                eater: false/creature
+            }
+            */
+            
+            var speciesArr = [];
+            /*
+            species: {
+                speed: float
+                size: float
+                energyCost: float
+                
+                color: Color
+                material: Material
+                
+                parentSpecies: species
+                descendantSpecies: [species]
+                
+                count: int
+                descendantCount: int
+            }
+            */
+            
+            // STATS
+            var stats = new Stats();
+            stats.showPanel( 0 );
+            
+            // GLOBALS
+            var paused = false;
+            
+            var ticksPerFrame = 1;
+            
+            var foodSpawnChance = 0.1;
+            var eatLength = 60;
+            var foodClumping = 1;
+            
+            var childAmount = 1;
+            var childSleepAmount = 60;
+            var mutationChance = 0.5;
+            var mutationMaxSize = 0.2;
+            
+            var startSize = 1;
+            var startSpeed = 0.15;
+            
+            var energyCostFunction = "speed^2*size";
+            var costFunctions = {};
+            costFunctions["speed^2*size"] = function(species) {return species.speed*species.speed*species.size*10};
+            costFunctions["speed^2*size^2"] = function(species) {return species.speed*species.speed*species.size*species.size*10};
+            costFunctions["speed^2*size+const"] = function(species) {return species.speed*species.speed*species.size*10+0.05};
+            costFunctions["speed*size"] = function(species) {return species.speed*species.size};
+            costFunctions["speed+size"] = function(species) {return species.speed+species.size*0.1};
+            costFunctions["speed^2*size+size"] = function(species) {return species.speed*species.speed*species.size*10+species.size*0.1};
+            var costFunction = function(species) {return species.speed*species.speed*species.size*10};
+            
+            // OBJECTS
+			function onLoad() { 
+				var canvasContainer = document.getElementById('myCanvasContainer');
+                document.body.appendChild( stats.dom );
+                
+				var width = 1200; 
+				var height = 800;
+				
+                renderer = new THREE.WebGLRenderer(); 
+                renderer.setSize(width, height);
+                canvasContainer.appendChild(renderer.domElement);
+                
+				camera = new THREE.PerspectiveCamera( 45, width/height, 0.01, 1000 );
+				camera.position.set(viewerPosition.x, viewerPosition.y, viewerPosition.z);
+				camera.up = new THREE.Vector3(0, 1, 0);
+				camera.lookAt(lookAt);
+                
+                scene = new THREE.Scene();
+                
+                foodGeometry = new THREE.CylinderGeometry( 2, 2, 2, 12 );
+                foodShader = new THREE.MeshPhongMaterial({color:"green"});
+                
+                creatureGeometry = new THREE.SphereGeometry( 1, 32, 32 );
+                
+                var plane = new THREE.Mesh(new THREE.PlaneGeometry(1000,1000, 0, 0), new THREE.MeshBasicMaterial({color:"#000000"}));
+                plane.rotation.y = Math.PI;
+                plane.rotation.x = Math.PI/2;
+                plane.position.y = -1;
+                scene.add(plane);
+                
+                var light = new THREE.PointLight( 0xffffff, 4, 1000 );
+                light.position.set( 50, 50, 50 );
+                scene.add( light );
+                
+                var light = new THREE.AmbientLight( 0xf0f0f0 ); // soft white light
+                scene.add( light );
+                
+                createGUI();
+                
+                reset();
+
+				draw();
+			}
+            
+            function createGUI() {
+                var gui = new dat.GUI();
+                
+                gui.add(this, "ticksPerFrame").min(0).step(1);
+                
+                var e = gui.add(this, "energyCostFunction", Object.keys(costFunctions));
+                e.onFinishChange(function(value) {
+                  costFunction = costFunctions[value];
+                });
+                
+                var f1 = gui.addFolder('Food');
+                f1.add(this, "eatLength").min(0).step(1);
+                f1.add(this, "foodSpawnChance", 0, 1);
+                f1.add(this, "foodClumping").min(1);
+                
+                var f2 = gui.addFolder('Breeding');
+                f2.add(this, "childAmount").min(1).step(1);
+                f2.add(this, "childSleepAmount").min(0).step(1);
+                f2.add(this, "mutationChance",0,1);
+                f2.add(this, "mutationMaxSize",0,1);
+                
+                var f3 = gui.addFolder('Start stats');
+                f3.add(this, "startSize").min(0);
+                f3.add(this, "startSpeed").min(0);
+                
+                gui.add(this, "paused");
+                gui.add(this, "reset");
+            }
+            
+            function reset() {
+                for (var c of creatureArr) {
+                    scene.remove(c.model);
+                }
+                creatureArr = [];
+                
+                for (var f of foodArr) {
+                    scene.remove(f.model);
+                }
+                foodArr = [];
+                
+                for (var s of speciesArr) {
+                    s.material.dispose();
+                }
+                speciesArr = [];
+                
+                var food = {
+                    energy: 100,
+                    position: new THREE.Vector3(0,0,0),
+                    model: new THREE.Mesh(foodGeometry, foodShader),
+                    scale: 2,
+                    seekers: [],
+                    eater: false
+                }
+                foodArr.push(food);
+                scene.add(food.model);
+                
+                var species = {
+                    speed: startSpeed,
+                    size: startSize,
+                    
+                    color: new THREE.Color(0.5,0.5,0.5),
+                    material: new THREE.MeshPhongMaterial({color: new THREE.Color(0.5,0.5,0.5)}),
+                    
+                    descendantSpecies: [],
+                    
+                    count: 0,
+                    descendantCount: 0
+                }
+                species.energyCost = costFunction(species);
+                speciesArr.push(species);
+                
+                spawnCreatureOfSpecies(species, new THREE.Vector3(10,0,0), 100);
+            }
+			
+            
+            var counter = 0;
+			function draw() {
+                requestAnimationFrame(draw);
+                
+                stats.begin();
+                
+                for (var i = 0; i < ticksPerFrame; i++) {
+                    if (paused)
+                        break;
+                    
+                    spawnFood();
+                    simulate();
+                }
+                
+                counter++;
+                if (counter > 60) {
+                    counter = 0;
+                    
+                }
+                
+                document.getElementById("creatureAmount").innerHTML = "Creatures: " + creatureArr.length;
+                
+                var sumSpeed = 0;
+                var sumSize = 0;
+                var sumEnergyConsume = 0;
+                var speciesCounter = 0;
+                for (var s of speciesArr) {
+                    if (s.count > 0) {
+                        speciesCounter++;
+                        sumSize += s.size*s.count;
+                        sumSpeed += s.speed*s.count;
+                        sumEnergyConsume += s.energyCost*s.count;
+                    }
+                }
+                document.getElementById("speciesAmount").innerHTML = "Species: " + speciesCounter;
+                document.getElementById("averageSize").innerHTML = "Average Size: " + (sumSize/creatureArr.length).toFixed(2);
+                document.getElementById("averageSpeed").innerHTML = "Average Speed: " + (sumSpeed/creatureArr.length).toFixed(2);
+                document.getElementById("totalEnergyConsumption").innerHTML = "Total Energu used: " + sumEnergyConsume.toFixed(2);
+                
+                renderer.render( scene, camera );
+                
+                stats.end();
+			}
+            
+            function spawnFood() {
+                if (Math.random() < foodSpawnChance) {
+                    var foodModel = new THREE.Mesh(foodGeometry, foodShader);
+                    
+                    var food = {
+                        energy: 100,
+                        position: new THREE.Vector3(Math.pow(Math.random(),foodClumping)*100-50,0,Math.pow(Math.random(),foodClumping)*100-50),
+                        model: foodModel,
+                        seekers: [],
+                        scale: 3,
+                        eater: false
+                    }
+                    food.model.position.add(food.position);
+                    scene.add(foodModel);
+                    addFood(food);
+                    foodArr.push(food);
+                }
+                var foodModel = new THREE.Mesh(foodGeometry, foodShader);
+            }
+            
+            function simulate() {
+                
+                for (var creature of creatureArr) {
+                    if (creature.sleeping) {
+                        creature.sleeping--;
+                        continue;
+                    }
+                    
+                    if (creature.eating) {
+                        handleEating(creature);
+                    } else if (creature.targetFood) {
+                        handleMovement(creature);
+                    }
+                        
+                    creature.energy -= creature.species.energyCost;
+                    
+                    if (creature.energy < 0) {
+                        handleDeath(creature)
+                    }
+                }
+            }
+            
+            function handleEating(creature) {
+                creature.eatProgress += 1;
+                if (creature.eatProgress > eatLength) {
+                    creature.energy += creature.targetFood.energy;
+                    removeFood(creature.targetFood);
+
+                    if (creature.energy > creature.species.size*100) {
+                        spawnChildren(creature)
+                    }
+                }
+            }
+            
+            function handleMovement(creature) {
+                var distToFood = creature.position.distanceTo(creature.targetFood.position);
+                var move = creature.species.speed;
+
+                if (distToFood-food.scale < creature.species.speed) {
+                    move = distToFood-food.scale;
+                    setNewEater(creature.targetFood, creature);
+                }
+
+                var moveVec = new THREE.Vector3();
+                moveVec.subVectors(creature.targetFood.position, creature.position).normalize();
+                moveVec.multiplyScalar(move);
+
+                creature.position.add(moveVec);
+                creature.model.position.add(moveVec);
+                //creature.model.lookAt(creature.targetFood.position);
+            }
+            
+            function handleDeath(creature) {
+                creatureArr.splice(creatureArr.indexOf(creature), 1);
+                if (creature.targetFood) {
+                    removeTarget(creature);
+                    addFood(creature.targetFood);
+                }
+                scene.remove(creature.model);
+                
+                creature.species.count--;
+                creature.species.descendantCount--;
+                if (creature.species.count == 0) {
+                    creature.species.material.dispose();
+                }
+                
+                var parent = creature.species.parentSpecies;
+                while (parent) {
+                    parent.descendantCount--;
+                    parent = parent.parentSpecies;
+                }
+            }
+            
+            function addFood(food) {
+                for (var creature of creatureArr) {
+                    if (creature.eating)
+                        continue;
+                    
+                    if (!creature.targetFood) {
+                        creature.targetFood = food;
+                        food.seekers.push(creature);
+                        continue;
+                    }
+                    
+                    var distToCurrent = creature.position.distanceToSquared(creature.targetFood.position);
+                    var distToNew = creature.position.distanceToSquared(food.position);
+                    if (distToNew < distToCurrent) {
+                        creature.targetFood.seekers.splice(creature.targetFood.seekers.indexOf(creature), 1);
+                        creature.targetFood = food;
+                        food.seekers.push(creature);
+                    }
+                }
+            }
+                
+            function removeFood(food) {
+                foodArr.splice(foodArr.indexOf(food), 1);
+                
+                if (food.eater) {
+                    food.eater.eatProgress = 0;
+                    food.eater.eating = false;
+                }
+                
+                for (var c of food.seekers) {
+                    c.targetFood = false;
+                    seekFood(c);
+                }
+                
+                food.seekers = [];
+                
+                scene.remove(food.model);
+            }
+                
+            function seekFood(creature) {
+                
+                var closestFood = false;
+                var closestDist = Infinity;
+                for (food of foodArr) {
+                    if (food.eater) {
+                        if (food.eater.species.size >= creature.species.size) {
+                            continue;
+                        }
+                    }
+                    
+                    var dist = creature.position.distanceToSquared(food.position);
+                    if (dist < closestDist) {
+                        closestDist = dist;
+                        closestFood = food;
+                    }
+                }
+                if (closestFood) {
+                    closestFood.seekers.push(creature);
+                    creature.targetFood = closestFood;
+                }
+            }
+            
+            function setNewEater(food, creature) {
+                if (food.eater) {
+                    food.eater.eatProgress = 0;
+                    food.eater.eating = false;
+                }
+                food.eater = creature;
+                food.eater.eating = true;
+                
+                for (var i = 0; i < food.seekers.length; i++) {
+                    if (food.seekers[i] == creature) {
+                        continue;
+                    }
+                    
+                    if (creature.species.size >= food.seekers[i].species.size ) {
+                        food.seekers[i].targetFood = false;
+                        seekFood(food.seekers[i]);
+                        food.seekers.splice(i, 1);
+                        i--;
+                    }
+                }
+            }
+            
+            function spawnChildren(creature) {
+                var energy = creature.energy / (1+childAmount);
+                creature.energy = energy;
+                
+                for (var i = 0; i < childAmount; i++) {
+                    var species = creature.species;
+                    
+                    if (Math.random() < mutationChance) {
+                        species = createMutatedSpecies(creature.species);
+                    }
+                    
+                    spawnCreatureOfSpecies(species, creature.position, energy, Math.floor(Math.random()*childSleepAmount+childSleepAmount) );
+                }
+            }
+            
+            function createMutatedSpecies(species) {
+                var newSpecies = {
+                    size: species.size*( 1 + (Math.random()-0.5)*2*mutationMaxSize ),
+                    speed: species.speed*( 1 + (Math.random()-0.5)*2*mutationMaxSize ),
+                    
+                    //material: species.material
+                    //material: new THREE.MeshBasicMaterial(),
+                    
+                    parentSpecies: species,
+                    descendantSpecies: [],
+                    
+                    count: 0,
+                    descendantCount: 0
+                };
+                
+                newSpecies.color = species.color.clone();
+                
+                newSpecies.color.r += (Math.random()-0.5)*2*mutationMaxSize;
+                newSpecies.color.g += (Math.random()-0.5)*2*mutationMaxSize;
+                newSpecies.color.b += (Math.random()-0.5)*2*mutationMaxSize;
+                
+                if (newSpecies.color.r < 0.1)
+                    newSpecies.color.r = 0.1;
+                if (newSpecies.color.g < 0.1)
+                    newSpecies.color.g = 0.1;
+                if (newSpecies.color.b < 0.1)
+                    newSpecies.color.b = 0.1;
+                
+                newSpecies.material = new THREE.MeshPhongMaterial({color: newSpecies.color});
+                //newSpecies.energyCost = newSpecies.size*newSpecies.speed*newSpecies.speed*10 + newSpecies.size*0.1;
+                newSpecies.energyCost = costFunction(newSpecies);
+                
+                speciesArr.push(newSpecies);
+                species.descendantSpecies.push(newSpecies);
+                return newSpecies;
+            }
+            
+            function spawnCreatureOfSpecies(species, position, energy, sleep = 0) {
+                var creature = {
+                    energy: energy,
+                    species: species,
+                    position: position.clone(),
+                    model: new THREE.Mesh(creatureGeometry, species.material),
+
+                    targetFood: false,
+                    eating: false,
+                    eatProgress: 0,
+                    
+                    sleeping: sleep
+                }
+                creature.model.position.add(position);
+                creature.model.scale.y *= species.size;
+                
+                creatureArr.push(creature);
+                scene.add(creature.model);
+                seekFood(creature);
+                
+                species.count++;
+                species.descendantCount++;
+                
+                var parent = species.parentSpecies;
+                while (parent) {
+                    parent.descendantCount++;
+                    parent = parent.parentSpecies;
+                }
+            }
+            
+            function removeTarget(creature) {
+                creature.targetFood.seekers.splice(creature.targetFood.seekers.indexOf(creature), 1);
+                if (creature.eating) {
+                    creature.eating = false;
+                    creature.targetFood.eater = false;
+                }
+            }
+			
+		</script>
+
+	</head>
+	<body onload="onLoad()">
+		<div id="myCanvasContainer"></div>
+		<div id="creatureAmount">
+			<span>Test</span>
+			<span>C1</span>
+		</div>
+        <div id="speciesAmount">
+			<span>Test</span>
+			<span>C1</span>
+		</div>
+        <div id="averageSize">
+			<span>Test</span>
+			<span>C1</span>
+		</div>
+        <div id="averageSpeed">
+			<span>Test</span>
+			<span>C1</span>
+		</div>
+        <div id="totalEnergyConsumption">
+			<span>Test</span>
+			<span>C1</span>
+		</div>
+	</body>
+</html>
